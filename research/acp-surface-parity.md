@@ -1,0 +1,62 @@
+# ACP surface for the parity features — what a remote client can reach
+
+Research for [PhillipChaffee/goose#4](https://github.com/PhillipChaffee/goose/issues/4) (map: #1).
+Inspected: local clone at v1.51.0 (workspace version in `Cargo.toml:11`), read-only, September 2026.
+
+## Question
+
+For each desktop client feature, what can a remote ACP client reach on current `goose serve` (v1.51.x), and what would need goose-core additions?
+
+## Reachability classes
+
+- **A** — reachable from a remote client via standard/stable ACP methods today.
+- **B** — reachable, but only via unstable `_goose/unstable/*` namespace methods (churn risk; see "Churn risk").
+- **C** — desktop-only today: done through Electron preload IPC, the goose binary CLI, or local files; a remote client needs another route or client-side reimplementation.
+
+Key structural fact: **every custom method rides the same ACP connection** — stdio (`goose acp`) or HTTP/WebSocket (`goose serve`, endpoint `/acp`, `crates/goose/src/acp/transport/mod.rs:225-247`). Dispatch is centralized in `crates/goose/src/acp/server/custom_dispatch.rs` (`#[custom_methods]` macro); names and JSON schemas are published in `crates/goose/acp-schema.json` (186 custom agent-side methods, 2 server→client notifications, 1 agent→client request). There is no per-transport gating of custom methods. The official desktop client reaches all of them through the same WebSocket the docs expose to any client, via the generated SDK `ui/goose-acp-client` (`@aaif/goose-acp-client`, version 1.51.0), whose method list is generated from `acp-schema.json` (`ui/goose-acp-client/src/generated/index.ts:5-561`).
+
+Advertised capabilities at `initialize` (`crates/goose/src/acp/server.rs:1825-1840`): `load_session`, `session/list` + `session/delete` + `session/close`, prompt (image, embedded context; **audio: false**), `mcp` http-only, plus `_meta.goose` (recipe parameter scopes). Auth methods: `goose-provider` (run `goose configure`) — `server.rs:1844-1847`.
+
+## Per-feature table
+
+| Feature | What a remote client can reach today | Class | Methods + refs |
+|---|---|---|---|
+| Extensions / MCP management — list | Full config-level list incl. enabled flag, config keys, warnings | **B** | `_goose/unstable/config/extensions/list` (`crates/goose-sdk-types/src/custom_requests.rs:484`); session-scoped: `_goose/unstable/session/extensions/list` (`custom_requests.rs:532`). Desktop path: `ui/desktop/src/acp/extensions.ts:80-95` |
+| Extensions / MCP — add/remove/enable-disable | Config CRUD for builtin/platform/MCP servers (incl. OAuth client fields, envKeys, tool allowlists) | **B** | `_goose/unstable/config/extensions/add` / `remove` / `set-enabled` (`custom_requests.rs:502,512,521`); live-session add/remove: `_goose/unstable/session/extensions/add` / `remove` (`custom_requests.rs:34,43`). Desktop: `ui/desktop/src/acp/extensions.ts:150-170` |
+| MCP attach at session start | Stdio/HTTP servers passed in `session/new` (`mcpServers`, incl. env/headers/timeout via `_meta.timeout`); SSE rejected. Client advertises MCP-host capabilities via `_meta.goose.mcpHostCapabilities` | **A** (partial) | `crates/goose/src/acp/server.rs:489-543` (`mcp_server_to_extension_config`, `add_mcp_servers`), `McpCapabilities::http(true)` at `server.rs:1839` |
+| Tools/resources over a session | List tools, call tool directly, read resource, set per-tool permission levels | **B** | `_goose/unstable/tools/list`, `tools/call`, `resources/read`, `tools/permissions/set` (`custom_requests.rs:52,100,82,2347`) |
+| Recipes — create/edit/import | Encode/decode deeplink, parse YAML, scan params, save, list, delete, slash-command registration, to-yaml; session import via `_meta.recipeId`/`recipeDeeplink` on `session/new` | **B** | `_goose/unstable/recipes/encode\|decode\|scan\|parse\|save\|list\|delete\|slash-command\|to-yaml` (`crates/goose-sdk-types/src/custom_requests/recipe.rs:298-406`). Desktop: `ui/desktop/src/acp/recipe.ts` |
+| Recipes — parameters | Agent→client request `_goose/unstable/session/recipe/request-params` if client advertises `goose.recipeParameterRequests`; **fallback to standard ACP form elicitation** otherwise | **B** + A fallback | `ui/goose-acp-client/src/generated/index.ts:578-584`; gating at `crates/goose/src/acp/server/recipe/mod.rs:386`; elicitation fallback `crates/goose/src/acp/server/elicitation.rs:26-42` |
+| Schedules (cron) | Full CRUD + run-now, pause/unpause, list scheduled sessions, kill/inspect running job | **B** | `_goose/unstable/schedules/list\|create\|delete\|update\|run-now\|sessions/list\|pause\|unpause\|running-job/kill\|running-job/inspect` (`crates/goose-sdk-types/src/custom_requests/schedule.rs:27-161`); also legacy `_goose/unstable/recipes/schedule` (`recipe.rs:384`) |
+| Skills | List (global + project-scoped), create, edit, delete, export/import JSON payloads; builtin skills read-only | **B** | `_goose/unstable/sources/list\|create\|update\|delete\|export\|import` with `SourceType::Skill`/`BuiltinSkill` (`custom_requests.rs:1479-1645`). Desktop: `ui/desktop/src/acp/sources.ts` |
+| Response styles | Nothing over ACP. Desktop-only renderer preference stored in Electron `settings.json`, affects display density of tool responses client-side; never crosses ACP; no crates involvement | **C** — but **pure client work** | `ui/desktop/src/components/settings/response_styles/ResponseStylesSection.tsx:11-23` (`window.electron.get/setSetting`), `ui/desktop/src/main.ts:1956-1997`, display logic `ui/desktop/src/components/ToolCallWithResponse.tsx:507-528`. A remote client just implements its own style setting |
+| Prompts (prompt templates) | List, read, save custom, reset to default | **B** | `_goose/unstable/config/prompts/list\|get\|save\|reset` (`custom_requests.rs:342-380`). Desktop: `ui/desktop/src/acp/prompts.ts` |
+| Live voice | Availability check, WebRTC SDP exchange (offer→answer), stop. Goose-core hosts the WebRTC peer (`crates/goose/src/live_voice/`); client captures mic and runs the browser RTCPeerConnection. Gated off under the legacy agent loop (availability reports Unavailable). Note standard `session/prompt` advertises `audio: false` | **B** + client WebRTC | `_goose/unstable/session/live-voice/availability\|start\|stop` (`custom_requests.rs:247-301`); server handler `crates/goose/src/acp/server/live_voice.rs`; desktop media session `ui/desktop/src/liveVoice/LiveVoiceMediaSession.ts` |
+| Dictation | Transcribe base64 audio, provider config status, local Whisper model list/download/progress/cancel/delete | **B** | `_goose/unstable/dictation/transcribe`, `dictation/config`, `dictation/models/*` (`custom_requests.rs:1649-2325`). Desktop: `ui/desktop/src/acp/dictation.ts` |
+| MCP Apps (UI-in-MCP) | App list/export/import/delete; tools list/call; resources read. Client declares host UI capability in `initialize` `_meta.goose.mcpHostCapabilities.extensions`; rendering is client-side via `@modelcontextprotocol/ext-apps` (iframe + postMessage). `goose serve` also exposes HTTP aux routes `/mcp-app-proxy` (GET) and `/mcp-app-guest` (POST) to host guest HTML with CSP | **B** + heavy client work | `custom_requests.rs:126-178` (apps CRUD), `:52,:100,:82` (tools/resources); host capability constants `ui/goose-acp-client/src/mcp-apps.ts:67-73`; desktop data layer `ui/desktop/src/acp/mcp-apps.ts`; renderer `ui/desktop/src/components/McpApps/McpAppRenderer.tsx`; proxy routes `crates/goose/src/acp/mcp_app_proxy.rs:376-390`, mounted at `crates/goose/src/acp/transport/mod.rs:244` |
+| Provider / model management | Per-session selection (provider, model, mode, thinking effort) via standard config options; full catalog/config/credential surface unstable: list, catalogs, config read/save/delete/authenticate, secrets list/delete, custom provider CRUD, inventory refresh, readiness check, supported models, canonical model info, defaults read/save/clear; OAuth device-code arrives as `_goose/unstable/providers/authentication/device-code` notification | **A** (per-session) + **B** (everything else) | Standard: `session/setConfigOption` (desktop `ui/desktop/src/acp/providers.ts:413-426`; options built in `crates/goose/src/acp/response_builder.rs:278-304`). Unstable: `providers/*`, `defaults/*` (`custom_requests.rs:638-1094,1709-1800`); notification `ui/goose-acp-client/src/generated/index.ts:571-573`; device-code UI `ui/desktop/src/hooks/useProviderDeviceCode.ts` |
+| Session management — list/load/new/fork/delete | Standard ACP methods, advertised capabilities; goose list filters via `_meta.types` / `_meta.query` (goose-specific meta on a standard method) | **A** | `session/list`, `session/load`, `session/new`, `session/fork`, `session/delete`, `session/close` (desktop `ui/desktop/src/acp/sessions.ts:161-280,312`; capabilities `crates/goose/src/acp/server.rs:1825-1831`) |
+| Session management — rename/archive/export/import/etc. | All goose extras unstable: info, rename, archive/unarchive, export (json/markdown), import (json/nostr share), share/nostr, conversation truncate, project update, working-dir update, system-prompt set, steer | **B** | `_goose/unstable/session/info\|rename\|archive\|unarchive\|export\|import\|share/nostr\|conversation/truncate\|project/update\|working-dir/update\|system-prompt/set\|steer` (`custom_requests.rs:742-866,181-232`) |
+
+## What is desktop-only (class C) across all features
+
+Only glue, not parity features: file pickers/writers (`select-recipe-file`, `select-import-session-file`, `write-file`, `show-save-dialog`, `list-files`), OS integration (`open-external`, notifications, wakelock, dock icon, spellcheck), and connection bootstrap (`get-secret-key`, `get-acp-url`) — `ui/desktop/src/main.ts:1930-2409`. Every feature payload already has an ACP method; e.g. recipe file import is "pick file (IPC) → `recipesParse` (ACP)", so a remote client substitutes its own file source and still calls the same ACP method. Response styles are the one true C feature and they need no goose-core work at all.
+
+## Summary
+
+- **Pure client work (no goose-core additions):** response styles (client-side preference); recipe/skill/session file import-export UX (payload-based unstable methods already exist); live voice + dictation (unstable methods exist; client implements mic capture / WebRTC / audio recording); MCP Apps rendering (unstable methods + client-side iframe/ext-apps work); provider OAuth browser-opening (device-code arrives over ACP).
+- **Rides unstable methods (churn risk, stable today):** extensions config CRUD, tools/resources direct access, recipes + schedules, skills/sources, prompt templates, dictation, provider catalog/config/secrets/custom/defaults, session rename/archive/import/export/steer/system-prompt — i.e. nearly every parity feature's data path.
+- **Needs goose-core additions:** none of the listed features is blocked. No parity feature requires a new goose-core method. The real gaps are (a) churn exposure on the `_goose/unstable` namespace and (b) client-side engineering (WebRTC, MCP Apps UI, elicitation/recipe-param handling), not server API.
+
+## Churn risk (from ticket #4 context; verify per-release)
+
+- `session/delete` was standardized upstream in ACP v1.47.0 (now advertised in `server.rs:1830`).
+- Seven unstable methods were removed in v1.49.0 — the `_goose/unstable/*` namespace carries no stability guarantee.
+- Provider method shapes changed in v1.50.0; the generated TS client is re-pinned per release (`@aaif/goose-acp-client` at 1.51.0 in `ui/desktop/package.json:52`).
+- Everything suffixed `_unstable` in `ui/goose-acp-client/src/generated/index.ts` should be treated as version-coupled to the `goose serve` binary; a remote client should pin SDK and server versions together.
+
+## Verification performed
+
+- Method names cross-checked between the Rust definitions (`crates/goose-sdk-types/src/custom_requests.rs` + `custom_requests/recipe.rs` + `custom_requests/schedule.rs`), the published schema (`crates/goose/acp-schema.json`, unique `x-method` values), and the generated TS client (`ui/goose-acp-client/src/generated/index.ts`).
+- Desktop call paths read in `ui/desktop/src/acp/*` to distinguish ACP calls from `window.electron.*` IPC; the full `ipcMain.handle` list in `ui/desktop/src/main.ts` was reviewed to confirm no parity feature depends on it for data.
+- Capability advertisement read at `crates/goose/src/acp/server.rs:1825-1847`.
