@@ -135,3 +135,17 @@ Some workspace crates, including those that make up the GDK, are published to cr
 - CLI: crates/goose-cli/src/main.rs
 - UI: ui/desktop/src/main.ts
 - Agent: crates/goose/src/agents/agent.rs
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as GitHub issues on PhillipChaffee/goose (origin), via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default triage label vocabulary (label strings equal to role names). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
